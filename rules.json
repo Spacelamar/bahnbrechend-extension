@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Origin", "operation": "set", "value": "https://www.bahn.de" },
+        { "header": "Referer", "operation": "set", "value": "https://www.bahn.de/" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||int.bahn.de/web/api/*",
+      "resourceTypes": ["xmlhttprequest"]
+    }
+  }
+]

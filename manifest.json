@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Bahnbrechend",
+  "version": "1.2.0",
+  "description": "Findet die günstigste Zugverbindung mit der höchsten Wahrscheinlichkeit der Zugbindungsaufhebung",
+  "permissions": ["declarativeNetRequest"],
+  "host_permissions": [
+    "*://int.bahn.de/*",
+    "*://bahnbrechend.net/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [{
+      "id": "headers",
+      "enabled": true,
+      "path": "rules.json"
+    }]
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://bahnbrechend.net/*",
+        "*://www.bahnbrechend.net/*",
+        "http://localhost:3000/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

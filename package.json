@@ -1,0 +1,25 @@
+{
+  "name": "bahnbrechend-extension",
+  "private": true,
+  "version": "1.2.0",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Toni Seyfert",
+  "homepage": "https://bahnbrechend.net",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Spacelamar/bahnbrechend-extension.git"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "build:prod": "NODE_ENV=production node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "chrome-types": "^0.1.0",
+    "esbuild": "^0.25.0",
+    "jszip": "^3.10.1",
+    "typescript": "^5.7.0"
+  }
+}
