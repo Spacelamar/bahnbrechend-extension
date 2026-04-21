@@ -791,7 +791,14 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
 
   const targetDate = new Date(dateStr);
   const scanStart = Date.now();
-  const scanData: Record<string, unknown> = { fromId, toId, searchDate: dateStr };
+  const scanData: Record<string, unknown> = {
+    fromId,
+    toId,
+    searchDate: dateStr,
+    // Extension version at scan-time — lets us distinguish "logged null
+    // because client was v1.1" from "logged null because hit had no data".
+    extensionVersion: chrome.runtime.getManifest().version,
+  };
   const allExperiments: ExperimentRecord[] = [];
   const zPairUpdates: ZPairUpdate[] = [];
 

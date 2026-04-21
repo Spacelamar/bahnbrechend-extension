@@ -7,7 +7,19 @@ import { runScan } from "./scan-engine";
 import { routeKey } from "../shared/zpair-types";
 
 const VERSION = chrome.runtime.getManifest().version;
+// Hard ceiling on scan runtime — if bahn.de ever hangs, a well-behaved
+// worker still aborts after this. Same checkAborted(signal) machinery
+// inside scan-engine.ts then propagates the "cancelled" error upward.
+const SCAN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 let activeController: AbortController | null = null;
+let activeTimeout: ReturnType<typeof setTimeout> | null = null;
+
+function clearScanTimeout() {
+  if (activeTimeout) {
+    clearTimeout(activeTimeout);
+    activeTimeout = null;
+  }
+}
 
 function sendToWeb(msg: ExtMessage) {
   // Send to ALL tabs that might have our content script
@@ -38,12 +50,21 @@ export function handleMessage(message: unknown, _sender: chrome.runtime.MessageS
     case "scan_start_extended": {
       // Cancel any running scan
       if (activeController) activeController.abort();
+      clearScanTimeout();
       activeController = new AbortController();
 
       const payload = msg.payload as ScanStartPayload;
       const isExtended = msg.type === "scan_start_extended";
       const requestId = msg.requestId;
       const signal = activeController.signal;
+
+      // Safety timeout: if bahn.de is unreachable/hanging and the scan
+      // would otherwise run forever, abort after 10 minutes. The scan
+      // engine's checkAborted(signal) reports this as a normal cancel.
+      activeTimeout = setTimeout(() => {
+        console.warn("[bahnbrechend] Scan exceeded 10min timeout, aborting");
+        if (activeController) activeController.abort();
+      }, SCAN_TIMEOUT_MS);
 
       console.log(`[bahnbrechend] Scan ${isExtended ? "extended " : ""}start: ${payload.fromId} → ${payload.toId} (${payload.date})`);
 
@@ -83,6 +104,7 @@ export function handleMessage(message: unknown, _sender: chrome.runtime.MessageS
           },
         });
         activeController = null;
+        clearScanTimeout();
       }).catch((err) => {
         if (err?.message === "cancelled") {
           console.log("[bahnbrechend] Scan cancelled");
@@ -96,6 +118,7 @@ export function handleMessage(message: unknown, _sender: chrome.runtime.MessageS
           });
         }
         activeController = null;
+        clearScanTimeout();
       });
       break;
     }
@@ -104,6 +127,7 @@ export function handleMessage(message: unknown, _sender: chrome.runtime.MessageS
       if (activeController) {
         activeController.abort();
         activeController = null;
+        clearScanTimeout();
         console.log("[bahnbrechend] Scan cancelled");
       }
       break;
