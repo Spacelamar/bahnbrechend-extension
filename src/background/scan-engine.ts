@@ -91,12 +91,70 @@ export interface ScanParams {
   signal: AbortSignal;
   onProgress: (progress: ScanProgress) => void;
   onResult: (result: OptimizeResult) => void;
+  /** If provided, skip Phase 1+2 and jump straight to the Extended-Scan
+   *  logic using the saved state from a previous scan on the same route.
+   *  Used when the user clicks "Score verbessern" — avoids re-running
+   *  the ~6 min of Phase 1+2 work that already succeeded. */
+  inheritedState?: InheritedScanState;
 }
 
 export interface ScanAnalytics {
   scanData: Record<string, unknown>;
   experiments: ExperimentRecord[];
   zPairUpdates: ZPairUpdate[];
+}
+
+// ============================================================
+// Inherited state — shape persisted to chrome.storage.session at the
+// end of each scan, so a subsequent manual extended scan ("Score
+// verbessern") can pick up where the previous one left off.
+// ============================================================
+
+/** Serializable form of CandidateEntry (stopovers Map → array of entries). */
+export interface SerializableCandidate {
+  journey: Journey;
+  stopoversEntries: [number, import("../shared/bahn-api").BahnStopover[]][];
+  structuralKey: string;
+  price: number;
+}
+
+export interface InheritedScanState {
+  fromId: string;
+  toId: string;
+  dateStr: string;
+  timestamp: number;             // ms since epoch — for staleness check
+  pMin: number;
+  pCap: number;
+  pCapExt: number;
+  nearDateWarning: boolean;
+  allReinFV: boolean;
+  nvStructuresFound: number;
+  fvStructuresFound: number;
+  candidates: SerializableCandidate[];
+  fvCandidates: SerializableCandidate[];
+  allVerified: VerifiedConfig[];
+  allExtendedCandidates: VerifiedConfig[];
+  sharedStopPool: Station[];
+  highScoreConfigs: VerifiedConfig[];
+  highScoreSeen: string[];
+}
+
+function serializeCandidate(c: CandidateEntry | FVCandidateEntry): SerializableCandidate {
+  return {
+    journey: c.journey,
+    stopoversEntries: [...c.stopovers.entries()],
+    structuralKey: c.structuralKey,
+    price: c.price,
+  };
+}
+
+export function deserializeCandidate(s: SerializableCandidate): CandidateEntry {
+  return {
+    journey: s.journey,
+    stopovers: new Map(s.stopoversEntries),
+    structuralKey: s.structuralKey,
+    price: s.price,
+  };
 }
 
 // ============================================================
@@ -809,7 +867,7 @@ async function runExtendedScan(
 // ============================================================
 
 export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
-  const { fromId, toId, date: dateStr, isExtended, topZPairs, signal, onProgress, onResult } = params;
+  const { fromId, toId, date: dateStr, isExtended, topZPairs, signal, onProgress, onResult, inheritedState } = params;
 
   // Fire-and-forget config refresh for the NEXT scan. This scan runs
   // against a frozen snapshot taken immediately below, so a refresh that
@@ -849,14 +907,106 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
   }
 
   let allVerified: VerifiedConfig[] = [];
+  let allExtendedCandidates: VerifiedConfig[] = [];
   let bestScore = 0;
   let pMin = 0;
   let pCap = 0;
+  let pCapExt = 0;
   let nearDateWarning = false;
+  let allReinFV = false;
   let candidates: CandidateEntry[] = [];
   let fvCandidates: FVCandidateEntry[] = [];
 
+  // Shared stop pool — populated either from Phase 1+2 fresh scan, or
+  // restored from inheritedState when the user clicks "Score verbessern".
+  // Consumed by the Extended-Scan step below.
+  const sharedStopPool: Station[] = [];
+  const sharedSeen = new Set<string>();
+
+  /** Add stops to the shared pool (deduplicates by station id). */
+  function addToSharedPool(stops: Station[]) {
+    for (const s of stops) {
+      if (!sharedSeen.has(s.id)) {
+        sharedSeen.add(s.id);
+        sharedStopPool.push(s);
+      }
+    }
+  }
+
+  // High-score configs (>=80%) collected regardless of price — used as
+  // fallback if no results land under pCapExt. Also reused across the
+  // Phase 1+2 → Extended boundary, and inherited from a previous scan
+  // when "Score verbessern" is clicked.
+  const highScoreConfigs: VerifiedConfig[] = [];
+  const highScoreSeen = new Set<string>();
+  const FALLBACK_SCORE_MIN = 0.80;
+
+  function collectHighScore(configs: VerifiedConfig[]) {
+    for (const c of configs) {
+      if (c.score >= FALLBACK_SCORE_MIN) {
+        const key = `${c.totalPrice.toFixed(2)}-${(c.score * 1000).toFixed(0)}`;
+        if (!highScoreSeen.has(key)) {
+          highScoreSeen.add(key);
+          highScoreConfigs.push(c);
+        }
+      }
+    }
+  }
+
   try {
+    if (inheritedState) {
+      // Reuse state from the previous scan on the same route — skip
+      // Phase 1+2 entirely and jump straight to the Extended-Scan below.
+      // This path runs when the user clicks "Score verbessern", which
+      // passes the last scan's accumulated state via scan_start_extended.
+      pMin = inheritedState.pMin;
+      pCap = inheritedState.pCap;
+      pCapExt = inheritedState.pCapExt;
+      nearDateWarning = inheritedState.nearDateWarning;
+      allReinFV = inheritedState.allReinFV;
+      candidates = inheritedState.candidates.map(deserializeCandidate);
+      fvCandidates = inheritedState.fvCandidates.map(deserializeCandidate) as FVCandidateEntry[];
+      allVerified = [...inheritedState.allVerified];
+      allExtendedCandidates = [...inheritedState.allExtendedCandidates];
+
+      // Restore shared pool (insertion order = priority, so route stop by stop)
+      for (const s of inheritedState.sharedStopPool) addToSharedPool([s]);
+
+      // Restore high-score pool + dedup keys so collectHighScore doesn't re-add
+      highScoreConfigs.push(...inheritedState.highScoreConfigs);
+      for (const k of inheritedState.highScoreSeen) highScoreSeen.add(k);
+
+      bestScore = allVerified.length > 0 ? allVerified[0].score : 0;
+
+      scanData.inheritedFromPreviousScan = true;
+      scanData.inheritedAgeMs = Date.now() - inheritedState.timestamp;
+      scanData.pMin = pMin;
+      scanData.pCap = pCap;
+      scanData.pCapExt = pCapExt;
+      scanData.nvStructuresFound = inheritedState.nvStructuresFound;
+      scanData.fvStructuresFound = inheritedState.fvStructuresFound;
+      scanData.allReinFV = allReinFV;
+      scanData.nearDateWarning = nearDateWarning;
+      scanData.fromName = candidates[0]?.journey.origin.name || fvCandidates[0]?.journey.origin.name;
+      scanData.toName = candidates[0]?.journey.destination.name || fvCandidates[0]?.journey.destination.name;
+      scanData.inheritedVerifiedCount = allVerified.length;
+      scanData.inheritedSharedPoolSize = sharedStopPool.length;
+      scanData.inheritedHighScoreCount = highScoreConfigs.length;
+
+      console.log(
+        `[scan] Inherited state: ${candidates.length} NV + ${fvCandidates.length} FV candidates, ` +
+        `pool ${sharedStopPool.length} stops, ${allVerified.length} verified, ` +
+        `${highScoreConfigs.length} high-score configs — skipping Phase 1+2`
+      );
+
+      // API-call budget: only the Extended-scan portion remains
+      const scanCfgInh = getConfig().scan;
+      const extCallBudgetInh =
+        scanCfgInh.extendedDays * 6 +
+        scanCfgInh.maxCandidatesPerPass * 10 +
+        scanCfgInh.maxFvCandidates * 15;
+      pt.estimatedTotal = pt.callsDone + extCallBudgetInh;
+    } else {
     // --- PHASE 1: Find cheapest NV-haltige journeys ---
     checkAborted(signal);
     sendProgress({
@@ -879,18 +1029,19 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
     }
 
     ({ candidates, fvCandidates, pMin, nearDateWarning } = { ...phase1 });
+    allReinFV = phase1.allReinFV;
 
     scanData.daysScanned = getConfig().scan.standardDays;
     scanData.pMin = pMin;
     scanData.nvStructuresFound = candidates.length;
     scanData.fvStructuresFound = fvCandidates.length;
-    scanData.allReinFV = phase1.allReinFV;
+    scanData.allReinFV = allReinFV;
     scanData.nearDateWarning = nearDateWarning;
     scanData.fromName = candidates[0]?.journey.origin.name || fvCandidates[0]?.journey.origin.name;
     scanData.toName = candidates[0]?.journey.destination.name || fvCandidates[0]?.journey.destination.name;
 
     // All FV, no FV candidates found at all
-    if (phase1.allReinFV && fvCandidates.length === 0) {
+    if (allReinFV && fvCandidates.length === 0) {
       scanData.terminationReason = "all_fv_no_candidates";
       onResult(buildResult(
         null, dateStr, [], 0, 0, 0,
@@ -904,7 +1055,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
     const capMul = cfgPrice.capMultiplier;
     const capExtMul = cfgPrice.capExtMultiplier;
     pCap = pMin > 0 ? capMul * pMin : (fvCandidates.length > 0 ? capMul * fvCandidates[0].price : 0);
-    const pCapExt = pMin > 0 ? capExtMul * pMin : (fvCandidates.length > 0 ? capExtMul * fvCandidates[0].price : 0);
+    pCapExt = pMin > 0 ? capExtMul * pMin : (fvCandidates.length > 0 ? capExtMul * fvCandidates[0].price : 0);
     scanData.pCap = pCap;
     scanData.pCapExt = pCapExt;
 
@@ -926,42 +1077,8 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
 
     const totalCandidates = standardCandidates.length + fvUnderCap.length;
 
-    allVerified = [];
-    let allExtendedCandidates: VerifiedConfig[] = [];
-    bestScore = 0;
     let phase2CandidatesTested = 0;
     let phase2ExperimentsGenerated = 0;
-
-    // --- Shared stop pool across all candidates (NV + FV) ---
-    const sharedStopPool: Station[] = [];
-    const sharedSeen = new Set<string>();
-
-    /** Add stops to the shared pool (deduplicates) */
-    function addToSharedPool(stops: Station[]) {
-      for (const s of stops) {
-        if (!sharedSeen.has(s.id)) {
-          sharedSeen.add(s.id);
-          sharedStopPool.push(s);
-        }
-      }
-    }
-
-    // Collect high-score configs (>80%) regardless of price — shown as fallback
-    const highScoreConfigs: VerifiedConfig[] = [];
-    const highScoreSeen = new Set<string>();
-    const FALLBACK_SCORE_MIN = 0.80;
-
-    function collectHighScore(configs: VerifiedConfig[]) {
-      for (const c of configs) {
-        if (c.score >= FALLBACK_SCORE_MIN) {
-          const key = `${c.totalPrice.toFixed(2)}-${(c.score * 1000).toFixed(0)}`;
-          if (!highScoreSeen.has(key)) {
-            highScoreSeen.add(key);
-            highScoreConfigs.push(c);
-          }
-        }
-      }
-    }
 
     // Pre-fill shared pool with NV-leg stopovers from ALL candidates (incl. over-pCap)
     // These stops are valid via-stop candidates even if the original connection is expensive
@@ -1204,6 +1321,36 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
     allVerified.sort((a, b) => b.score - a.score);
     if (allVerified.length > 0) bestScore = allVerified[0].score;
 
+    // Persist state so a future "Score verbessern" click can skip
+    // Phase 1+2 and jump straight to Extended. Saved BEFORE decision
+    // logic so the state captures a "Phase 1+2 done" snapshot that
+    // feeds cleanly into the Extended-Scan wherever it runs from.
+    if (candidates.length > 0 || fvCandidates.length > 0) {
+      const stateToSave: InheritedScanState = {
+        fromId, toId, dateStr,
+        timestamp: Date.now(),
+        pMin, pCap, pCapExt,
+        nearDateWarning, allReinFV,
+        nvStructuresFound: candidates.length,
+        fvStructuresFound: fvCandidates.length,
+        candidates: candidates.map(serializeCandidate),
+        fvCandidates: fvCandidates.map(serializeCandidate),
+        allVerified: [...allVerified],
+        allExtendedCandidates: [...allExtendedCandidates],
+        sharedStopPool: [...sharedStopPool],
+        highScoreConfigs: [...highScoreConfigs],
+        highScoreSeen: [...highScoreSeen],
+      };
+      try {
+        await chrome.storage.session.set({ lastScanState: stateToSave });
+        console.log(`[scan] Saved state to session storage (${sharedStopPool.length} pool stops, ${allVerified.length} verified)`);
+      } catch (err) {
+        // Non-fatal — "Score verbessern" just won't have accumulated state
+        console.warn("[scan] Failed to persist lastScanState:", err);
+      }
+    }
+    } // end else (fresh Phase 1+2)
+
     // --- Decision logic ---
     const scoringCfg = getConfig().scoring;
     const shouldAutoExtend = isExtended || bestScore < scoringCfg.min;
@@ -1296,7 +1443,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
       onResult(buildResult(
         displayJourney, dateStr, allVerified,
         pMin, pCap, bestScore,
-        false, true, phase1.allReinFV && allVerified.length === 0, nearDateWarning, true
+        false, true, allReinFV && allVerified.length === 0, nearDateWarning, true
       ));
     } else if (canExtend && bestScore >= scoringCfg.min) {
       const displayJourney = candidates[0]?.journey || (fvCandidates[0]?.journey ?? null);
@@ -1310,7 +1457,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
       onResult(buildResult(
         displayJourney, dateStr, allVerified,
         pMin, pCap, bestScore,
-        false, false, phase1.allReinFV && allVerified.length === 0, nearDateWarning, false
+        false, false, allReinFV && allVerified.length === 0, nearDateWarning, false
       ));
     }
 

@@ -3,7 +3,7 @@
  */
 
 import { isWebMessage, type WebMessage, type ExtMessage, type ScanStartPayload } from "../shared/protocol";
-import { runScan } from "./scan-engine";
+import { runScan, type InheritedScanState } from "./scan-engine";
 import { routeKey } from "../shared/zpair-types";
 
 const VERSION = chrome.runtime.getManifest().version;
@@ -11,6 +11,11 @@ const VERSION = chrome.runtime.getManifest().version;
 // worker still aborts after this. Same checkAborted(signal) machinery
 // inside scan-engine.ts then propagates the "cancelled" error upward.
 const SCAN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+// Max age of inherited state before we treat it as stale and fall back
+// to a full rescan. 15 min matches typical user workflow: click scan,
+// review results, click "Score verbessern" shortly after. Beyond that
+// the underlying schedules/prices may have shifted.
+const STATE_MAX_AGE_MS = 15 * 60 * 1000;
 let activeController: AbortController | null = null;
 let activeTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -68,31 +73,62 @@ export function handleMessage(message: unknown, _sender: chrome.runtime.MessageS
 
       console.log(`[bahnbrechend] Scan ${isExtended ? "extended " : ""}start: ${payload.fromId} → ${payload.toId} (${payload.date})`);
 
-      // Run scan asynchronously
-      runScan({
-        fromId: payload.fromId,
-        toId: payload.toId,
-        date: payload.date,
-        isExtended,
-        topZPairs: payload.topZPairs as [],
-        signal,
-        onProgress: (progress) => {
-          sendToWeb({
-            source: "bahnbrechend-ext",
-            requestId,
-            type: "progress",
-            payload: progress,
-          });
-        },
-        onResult: (result) => {
-          sendToWeb({
-            source: "bahnbrechend-ext",
-            requestId,
-            type: "result",
-            payload: result,
-          });
-        },
-      }).then((analytics) => {
+      // For the manual "Score verbessern" click, try to reuse the state
+      // from the previous scan on the same route. This lets the extended
+      // scan skip Phase 1+2 and pick up with the already-accumulated
+      // ~140-stop shared pool, the pMin/pCap values, existing verified
+      // results, etc. — cutting ~5 min off the flow.
+      const startScan = async () => {
+        let inheritedState: InheritedScanState | undefined;
+        if (isExtended) {
+          try {
+            const stored = await chrome.storage.session.get("lastScanState");
+            const s = stored.lastScanState as InheritedScanState | undefined;
+            if (s) {
+              const routeMatch = s.fromId === payload.fromId && s.toId === payload.toId;
+              const dateMatch = s.dateStr === payload.date;
+              const age = Date.now() - s.timestamp;
+              const fresh = age < STATE_MAX_AGE_MS;
+              if (routeMatch && dateMatch && fresh) {
+                inheritedState = s;
+                console.log(`[bahnbrechend] Reusing state from ${Math.round(age / 1000)}s ago (${s.sharedStopPool.length} pool stops, ${s.allVerified.length} verified)`);
+              } else {
+                console.log(`[bahnbrechend] Skipping inherited state — routeMatch=${routeMatch} dateMatch=${dateMatch} fresh=${fresh} (age=${Math.round(age / 1000)}s)`);
+              }
+            }
+          } catch (err) {
+            console.warn("[bahnbrechend] Failed to read lastScanState:", err);
+          }
+        }
+
+        return runScan({
+          fromId: payload.fromId,
+          toId: payload.toId,
+          date: payload.date,
+          isExtended,
+          topZPairs: payload.topZPairs as [],
+          signal,
+          onProgress: (progress) => {
+            sendToWeb({
+              source: "bahnbrechend-ext",
+              requestId,
+              type: "progress",
+              payload: progress,
+            });
+          },
+          onResult: (result) => {
+            sendToWeb({
+              source: "bahnbrechend-ext",
+              requestId,
+              type: "result",
+              payload: result,
+            });
+          },
+          inheritedState,
+        });
+      };
+
+      startScan().then((analytics) => {
         // Send analytics data to web page (which POSTs to API)
         sendToWeb({
           source: "bahnbrechend-ext",
