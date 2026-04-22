@@ -1,7 +1,7 @@
 {
   "name": "bahnbrechend-extension",
   "private": true,
-  "version": "1.2.2",
+  "version": "1.2.3",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
   "author": "Toni Seyfert",

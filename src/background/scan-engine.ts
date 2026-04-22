@@ -482,11 +482,36 @@ async function runExtendedScan(
   onProgress: (p: ScanProgress) => void,
   signal: AbortSignal,
   experiments: ExperimentRecord[],
-  inheritedStopPool?: Station[]
+  inheritedStopPool?: Station[],
+  // Callback so that high-score configs found DURING the extended scan
+  // (not just in Phase 2) are visible to the 90%-fallback at end-of-scan.
+  collectHighScore?: (configs: VerifiedConfig[]) => void,
+  // Callback to bump the outer progress tracker's callsDone counter —
+  // without this, the ~100+ API calls that the extended scan now makes
+  // via verifyConfigs go uncounted and the UI's remaining-time estimate
+  // gets stuck.
+  bumpCallsDone?: () => void
 ): Promise<ExtendedScanResult> {
   const results: VerifiedConfig[] = [...alreadyFoundExtCandidates];
   const extZPairUpdates: ZPairUpdate[] = [];
   const dateStr = targetDate.toISOString().split("T")[0];
+
+  // Shared progress-callback for every verifyConfigs call inside the
+  // extended scan. Bumps the outer callsDone counter and emits an
+  // `extended_verifying` progress event so the UI's remaining-time
+  // estimate actually moves. Without this, the 100+ API calls that Steps
+  // 2/3/5/6 make during extended-scan are invisible to the ProgressBar
+  // and the "Noch X Sekunden" text freezes at the last value from Phase 2.
+  function verifyProgressCb(cur: number, tot: number) {
+    bumpCallsDone?.();
+    checkAborted(signal);
+    onProgress({
+      phase: "extended_verifying",
+      current: cur,
+      total: tot,
+      message: `Erweiterte Optimierung (${cur}/${tot})...`,
+    });
+  }
 
   // Shared stop pool — start with inherited pool from Phase 2
   const extStopPool: Station[] = [...(inheritedStopPool || [])];
@@ -545,9 +570,10 @@ async function runExtendedScan(
 
     const result = await verifyConfigs(exps, entry.journey, {
       originalPrice: entry.price, pMin, pCap, pCapExt,
-    }, () => checkAborted(signal));
+    }, verifyProgressCb);
     results.push(...result.standard);
     results.push(...result.extendedCandidates);
+    collectHighScore?.(result.allWithTransfers);
     for (const config of result.allWithTransfers) {
       const nvSegs = config.realSegments.filter(seg => !isFernverkehrLeg({ line: { product: "", name: seg.trainName } }));
       addToExtPool(extractPoolFromRealSegments(nvSegs, new Set()));
@@ -590,7 +616,7 @@ async function runExtendedScan(
     if (seedExperiments.length > 0) {
       const seedResult = await verifyConfigs(seedExperiments, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
-      }, () => checkAborted(signal));
+      }, verifyProgressCb);
 
       for (const log of seedResult.experimentLogs) {
         if (log.viaStops.length >= 2 && log.resultScore !== undefined && log.resultPrice !== undefined) {
@@ -608,6 +634,7 @@ async function runExtendedScan(
 
       results.push(...seedResult.standard);
       results.push(...seedResult.extendedCandidates);
+      collectHighScore?.(seedResult.allWithTransfers);
 
       // Enrich pool from NV leg halte
       for (const config of seedResult.allWithTransfers) {
@@ -623,9 +650,10 @@ async function runExtendedScan(
     if (mainExperiments.length > 0) {
       const result = await verifyConfigs(mainExperiments, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
-      }, () => checkAborted(signal));
+      }, verifyProgressCb);
       results.push(...result.standard);
       results.push(...result.extendedCandidates);
+      collectHighScore?.(result.allWithTransfers);
 
       for (const log of result.experimentLogs) {
         if (log.viaStops.length >= 2 && log.resultScore !== undefined && log.resultPrice !== undefined) {
@@ -675,9 +703,10 @@ async function runExtendedScan(
 
     const result = await verifyConfigs(exps, entry.journey, {
       originalPrice: entry.price, pMin, pCap, pCapExt,
-    }, () => checkAborted(signal));
+    }, verifyProgressCb);
     results.push(...result.standard);
     results.push(...result.extendedCandidates);
+    collectHighScore?.(result.allWithTransfers);
     for (const config of result.allWithTransfers) {
       const nvSegs = config.realSegments.filter(seg => !isFernverkehrLeg({ line: { product: "", name: seg.trainName } }));
       addToExtPool(extractPoolFromRealSegments(nvSegs, new Set()));
@@ -720,7 +749,7 @@ async function runExtendedScan(
     if (seedExps.length > 0) {
       const seedResult = await verifyConfigs(seedExps, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
-      }, () => checkAborted(signal));
+      }, verifyProgressCb);
       results.push(...seedResult.standard);
       results.push(...seedResult.extendedCandidates);
 
@@ -752,7 +781,7 @@ async function runExtendedScan(
     if (mainExps.length > 0) {
       const result = await verifyConfigs(mainExps, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
-      }, () => checkAborted(signal));
+      }, verifyProgressCb);
       results.push(...result.standard);
       results.push(...result.extendedCandidates);
 
@@ -1185,6 +1214,20 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
       scanData.extendedTriggered = true;
       scanData.extendedAuto = !isExtended;
 
+      // Re-estimate total API-call budget for the extended phase. The
+      // earlier `+ 15 extended scan buffer` was set before the Step-4
+      // fill-up feature existed — now extended typically makes ~150
+      // calls (30 for day-window scans + ~120 for the NV/FV candidate
+      // verifies it now feeds into the pipeline). Without this update
+      // the UI's remaining-time text would freeze near where Phase 2
+      // left off, since the old estimate is already (nearly) maxed out.
+      const scanCfg = getConfig().scan;
+      const extCallBudget =
+        scanCfg.extendedDays * 6 +                   // day-window scans
+        scanCfg.maxCandidatesPerPass * 10 +          // Step-5 NV verify
+        scanCfg.maxFvCandidates * 15;                // Step-6 FV (seed+main)
+      pt.estimatedTotal = pt.callsDone + extCallBudget;
+
       sendProgress({
         phase: "extended_scanning" as ScanProgress["phase"],
         current: 0, total: 1,
@@ -1198,7 +1241,9 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         (p) => { checkAborted(signal); sendProgress(p); },
         signal,
         allExperiments,
-        sharedStopPool
+        sharedStopPool,
+        collectHighScore,
+        () => { pt.callsDone++; }
       );
 
       // Merge extended results and zPair updates
@@ -1207,7 +1252,8 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
       allVerified.sort((a, b) => b.score - a.score);
       bestScore = allVerified.length > 0 ? allVerified[0].score : 0;
 
-      // Fallback: if no result >=80% under pCapExt, include high-score configs over pCapExt
+      // Fallback 1: if no result >=80% (FALLBACK_SCORE_MIN) under pCapExt,
+      // include high-score configs over pCapExt (no upper price cap).
       if (bestScore < FALLBACK_SCORE_MIN && highScoreConfigs.length > 0) {
         const overCapHighScore = highScoreConfigs.filter(c =>
           !allVerified.some(v => `${v.totalPrice.toFixed(2)}-${(v.score * 1000).toFixed(0)}` === `${c.totalPrice.toFixed(2)}-${(c.score * 1000).toFixed(0)}`)
@@ -1215,6 +1261,32 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         if (overCapHighScore.length > 0) {
           console.log(`[fallback] Adding ${overCapHighScore.length} high-score configs (>80%) that exceed pCapExt`);
           allVerified = deduplicateConfigs([...allVerified, ...overCapHighScore]);
+          allVerified.sort((a, b) => b.score - a.score);
+          bestScore = allVerified.length > 0 ? allVerified[0].score : 0;
+        }
+      }
+
+      // Fallback 2: even if we have some >=80% results, if none of them
+      // is >=90% (scoring.ideal), surface any 90%+ configs that were
+      // found above pCapExt but below pCapMax (4× pMin). Rationale: a
+      // 91% result at 3.5× pMin is more useful to show than a 82% at
+      // pCap — the user can decide whether the extra cost is worth
+      // the higher cancellation-probability score.
+      const pCapMax = pMin * 4;
+      const idealScore = getConfig().scoring.ideal;
+      if (bestScore < idealScore && highScoreConfigs.length > 0) {
+        const idealOverCap = highScoreConfigs.filter(c =>
+          c.score >= idealScore &&
+          c.totalPrice > pCapExt &&
+          c.totalPrice <= pCapMax &&
+          !allVerified.some(v => `${v.totalPrice.toFixed(2)}-${(v.score * 1000).toFixed(0)}` === `${c.totalPrice.toFixed(2)}-${(c.score * 1000).toFixed(0)}`)
+        );
+        if (idealOverCap.length > 0) {
+          console.log(
+            `[fallback] Adding ${idealOverCap.length} ideal-score configs (>=${(idealScore * 100).toFixed(0)}%) ` +
+            `between pCapExt (${pCapExt.toFixed(2)}€) and pCapMax (${pCapMax.toFixed(2)}€)`
+          );
+          allVerified = deduplicateConfigs([...allVerified, ...idealOverCap]);
           allVerified.sort((a, b) => b.score - a.score);
           bestScore = allVerified.length > 0 ? allVerified[0].score : 0;
         }
