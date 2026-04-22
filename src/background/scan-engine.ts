@@ -137,6 +137,10 @@ export interface InheritedScanState {
   sharedStopPool: Station[];
   highScoreConfigs: VerifiedConfig[];
   highScoreSeen: string[];
+  /** Via-stop pair keys already sent to bahn.de in the previous scan.
+   *  Avoids re-testing them when the user clicks "Score verbessern" —
+   *  the extended-scan will skip these and pick fresh pairs instead. */
+  testedPairs: string[];
 }
 
 function serializeCandidate(c: CandidateEntry | FVCandidateEntry): SerializableCandidate {
@@ -548,7 +552,10 @@ async function runExtendedScan(
   // without this, the ~100+ API calls that the extended scan now makes
   // via verifyConfigs go uncounted and the UI's remaining-time estimate
   // gets stuck.
-  bumpCallsDone?: () => void
+  bumpCallsDone?: () => void,
+  // Scan-wide dedup set — shared with Phase 2. Every pair we generate
+  // here is recorded; pairs already tested in Phase 2 are skipped.
+  testedPairs?: Set<string>
 ): Promise<ExtendedScanResult> {
   const results: VerifiedConfig[] = [...alreadyFoundExtCandidates];
   const extZPairUpdates: ZPairUpdate[] = [];
@@ -623,7 +630,7 @@ async function runExtendedScan(
 
     const legs = buildLegsWithStopovers(entry);
     addToExtPool(buildNVStopPool(legs));
-    const exps = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId);
+    const exps = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId, testedPairs);
     if (exps.length === 0) continue;
 
     const result = await verifyConfigs(exps, entry.journey, {
@@ -670,7 +677,7 @@ async function runExtendedScan(
     if (extStopPool.length < 2) continue;
 
     // FV Seed Step
-    const seedExperiments = generateCandidateConfigs(extStopPool, [], fromId, toId).slice(0, 5);
+    const seedExperiments = generateCandidateConfigs(extStopPool, [], fromId, toId, testedPairs).slice(0, 5);
     if (seedExperiments.length > 0) {
       const seedResult = await verifyConfigs(seedExperiments, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
@@ -704,7 +711,7 @@ async function runExtendedScan(
     }
 
     // Main FV experiments with enriched pool
-    const mainExperiments = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId);
+    const mainExperiments = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId, testedPairs);
     if (mainExperiments.length > 0) {
       const result = await verifyConfigs(mainExperiments, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
@@ -756,7 +763,7 @@ async function runExtendedScan(
 
     const legs = buildLegsWithStopovers(entry);
     addToExtPool(buildNVStopPool(legs));
-    const exps = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId);
+    const exps = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId, testedPairs);
     if (exps.length === 0) continue;
 
     const result = await verifyConfigs(exps, entry.journey, {
@@ -803,7 +810,7 @@ async function runExtendedScan(
     if (extStopPool.length < 2) continue;
 
     // FV Seed
-    const seedExps = generateCandidateConfigs(extStopPool, [], fromId, toId).slice(0, 5);
+    const seedExps = generateCandidateConfigs(extStopPool, [], fromId, toId, testedPairs).slice(0, 5);
     if (seedExps.length > 0) {
       const seedResult = await verifyConfigs(seedExps, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
@@ -835,7 +842,7 @@ async function runExtendedScan(
     }
 
     // Main FV experiments
-    const mainExps = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId);
+    const mainExps = generateCandidateConfigs(extStopPool, topZPairs, fromId, toId, testedPairs);
     if (mainExps.length > 0) {
       const result = await verifyConfigs(mainExps, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
@@ -953,6 +960,15 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
     }
   }
 
+  // Scan-wide dedup: we never ship the same via-stop pair to bahn.de
+  // twice in one scan run. Historical data showed ~18% of API calls
+  // were exact duplicates (same pair tested again in fv_phase2 after
+  // fv_seed, or re-rolled by the random picker in a later candidate's
+  // generate call). `generateCandidateConfigs` reads and writes this
+  // set directly — any pair it emits is added, any pair already in the
+  // set is skipped. Restored from inheritedState on "Score verbessern".
+  const testedPairs = new Set<string>();
+
   try {
     if (inheritedState) {
       // Reuse state from the previous scan on the same route — skip
@@ -975,6 +991,10 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
       // Restore high-score pool + dedup keys so collectHighScore doesn't re-add
       highScoreConfigs.push(...inheritedState.highScoreConfigs);
       for (const k of inheritedState.highScoreSeen) highScoreSeen.add(k);
+
+      // Restore scan-wide dedup so "Score verbessern" doesn't repeat any
+      // pair that was already tried in the previous Phase 1+2 run.
+      for (const k of inheritedState.testedPairs || []) testedPairs.add(k);
 
       bestScore = allVerified.length > 0 ? allVerified[0].score : 0;
 
@@ -1118,7 +1138,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
 
         const legs = buildLegsWithStopovers(entry);
         addToSharedPool(buildNVStopPool(legs));
-        const exps = generateCandidateConfigs(sharedStopPool, topZPairs, fromId, toId);
+        const exps = generateCandidateConfigs(sharedStopPool, topZPairs, fromId, toId, testedPairs);
         phase2ExperimentsGenerated += exps.length;
 
         if (exps.length === 0) continue;
@@ -1203,7 +1223,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         if (sharedStopPool.length < 2) continue;
 
         // --- FV Seed Step: 5 random experiments from shared pool to discover NV legs ---
-        const seedExperiments = generateCandidateConfigs(sharedStopPool, [], fromId, toId).slice(0, 5);
+        const seedExperiments = generateCandidateConfigs(sharedStopPool, [], fromId, toId, testedPairs).slice(0, 5);
         phase2ExperimentsGenerated += seedExperiments.length;
 
         if (seedExperiments.length > 0) {
@@ -1260,7 +1280,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         }
 
         // --- Normal Phase 2b: winners + random from enriched pool ---
-        const mainExperiments = generateCandidateConfigs(sharedStopPool, topZPairs, fromId, toId);
+        const mainExperiments = generateCandidateConfigs(sharedStopPool, topZPairs, fromId, toId, testedPairs);
         phase2ExperimentsGenerated += mainExperiments.length;
 
         if (mainExperiments.length === 0) continue;
@@ -1340,6 +1360,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         sharedStopPool: [...sharedStopPool],
         highScoreConfigs: [...highScoreConfigs],
         highScoreSeen: [...highScoreSeen],
+        testedPairs: [...testedPairs],
       };
       try {
         await chrome.storage.session.set({ lastScanState: stateToSave });
@@ -1390,7 +1411,8 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         allExperiments,
         sharedStopPool,
         collectHighScore,
-        () => { pt.callsDone++; }
+        () => { pt.callsDone++; },
+        testedPairs
       );
 
       // Merge extended results and zPair updates

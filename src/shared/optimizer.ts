@@ -72,7 +72,8 @@ export function generateCandidateConfigs(
   stopPool: Station[],
   topZPairs: ZPair[] = [],
   fromId?: string,
-  toId?: string
+  toId?: string,
+  alreadyTestedPairs?: Set<string>
 ): ViaStopCandidate[] {
   // Carry provenance (cache-hit + prior zScore) alongside each pair so
   // the ExperimentLog can record whether a hit came from the zPair cache
@@ -82,7 +83,12 @@ export function generateCandidateConfigs(
     fromCache: boolean;
     priorZscore?: number;
   }[] = [];
+  // `seen` tracks dedup WITHIN this call. `alreadyTestedPairs` (optional)
+  // tracks dedup ACROSS the whole scan — same pair tested in a previous
+  // candidate/phase won't be sent to the API again. Both use the same
+  // order-sensitive `id,id` key format.
   const seen = new Set<string>();
+  const scanDedup = alreadyTestedPairs; // readability alias
 
   // Validate a pair: origin never as 1st stop, destination never as any stop
   const isValidPair = (stops: Station[]): boolean => {
@@ -92,15 +98,18 @@ export function generateCandidateConfigs(
     return true;
   };
 
+  let skippedAlreadyTested = 0;
+
   // Tier 1: Winners from persistent pool
   for (const zp of topZPairs) {
     const pair = [zp.stop1, zp.stop2];
     if (!isValidPair(pair)) continue;
     const key = pair.map(s => s.id).join(",");
-    if (!seen.has(key)) {
-      seen.add(key);
-      experiments.push({ stops: pair, fromCache: true, priorZscore: zp.zScore });
-    }
+    if (seen.has(key)) continue;
+    if (scanDedup?.has(key)) { skippedAlreadyTested++; continue; }
+    seen.add(key);
+    scanDedup?.add(key);
+    experiments.push({ stops: pair, fromCache: true, priorZscore: zp.zScore });
   }
 
   const numWinners = experiments.length;
@@ -108,24 +117,32 @@ export function generateCandidateConfigs(
   // Tier 2: Random from connection stop pool
   if (stopPool.length >= 2) {
     const maxExperiments = getConfig().scan.maxExperiments;
-    for (let attempt = 0; attempt < maxExperiments * 10 && experiments.length < maxExperiments; attempt++) {
+    // Bei Dedup brauchen wir eventuell mehr Attempts — das Set kann
+    // viele Kandidaten rausfiltern. Doppelter Loop-Headroom reicht
+    // praktisch (unique-Raum wächst quadratisch mit pool size).
+    const attemptBudget = maxExperiments * (scanDedup ? 20 : 10);
+    for (let attempt = 0; attempt < attemptBudget && experiments.length < maxExperiments; attempt++) {
       const pair = pick2Random(stopPool);
       if (!pair) break;
       if (!isValidPair(pair)) continue;
       const key = pair.map((s) => s.id).join(",");
       if (seen.has(key)) continue;
+      if (scanDedup?.has(key)) { skippedAlreadyTested++; continue; }
       seen.add(key);
+      scanDedup?.add(key);
       experiments.push({ stops: pair, fromCache: false });
     }
   } else if (stopPool.length === 1) {
     const key = stopPool[0].id;
-    if (!seen.has(key)) {
+    if (!seen.has(key) && !scanDedup?.has(key)) {
       seen.add(key);
+      scanDedup?.add(key);
       experiments.push({ stops: [stopPool[0]], fromCache: false });
     }
   }
 
-  console.log(`[generateCandidates] ${experiments.length} experiments (${numWinners} winners + ${experiments.length - numWinners} random from ${stopPool.length} stops)`);
+  const dedupNote = skippedAlreadyTested > 0 ? ` [dedup skipped ${skippedAlreadyTested}]` : "";
+  console.log(`[generateCandidates] ${experiments.length} experiments (${numWinners} winners + ${experiments.length - numWinners} random from ${stopPool.length} stops)${dedupNote}`);
 
   return experiments.map((e) => ({
     viaStops: e.stops,
