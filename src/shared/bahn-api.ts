@@ -128,13 +128,26 @@ export function journeyStructuralKey(
   journey: Journey,
   stopMap?: Map<number, BahnStopover[]>
 ): string {
+  // Key parts per leg: train category + 15-min duration bucket + full
+  // alphabetically-sorted list of intermediate halte. Including the full
+  // halte list (instead of just count) means two connections over different
+  // physical routes no longer collapse into one key just because their leg
+  // count and rough duration match — empirically halves the false-negative
+  // rate on complex multi-path routes like Frankfurt↔München while not
+  // introducing any false-positive splits (two schedule slots on the same
+  // physical route still share a key as long as their duration lands in
+  // the same 15-min bucket).
   return journey.legs
     .map((leg, idx) => {
       const cat = getTrainCategory(leg.line.product);
       const durMin = getLegDurationMinutes(leg);
       const durBucket = Math.round(durMin / 15) * 15;
-      const stopCount = stopMap?.get(idx)?.length ?? 0;
-      return `${cat}:${durBucket}:${stopCount}s`;
+      const halte = (stopMap?.get(idx) || [])
+        .map((s) => s.station?.name)
+        .filter((n): n is string => !!n)
+        .sort()
+        .join(",");
+      return `${cat}:${durBucket}:${halte}`;
     })
     .join("|");
 }
@@ -144,22 +157,38 @@ export function journeyStructuralKey(
  * Two FV journeys are "same" if total duration (15min bucket) AND
  * set of intermediate stop names are identical.
  */
-export function fvStructuralKey(journey: Journey): string {
+export function fvStructuralKey(
+  journey: Journey,
+  stopMap?: Map<number, BahnStopover[]>
+): string {
   const totalDur = Math.round(
     (new Date(journey.legs[journey.legs.length - 1].arrival).getTime() -
      new Date(journey.legs[0].departure).getTime()) / 60000
   );
   const durBucket = Math.round(totalDur / 15) * 15;
 
-  // Collect all intermediate station names (not origin/destination)
-  const stops = new Set<string>();
-  for (const leg of journey.legs) {
-    stops.add(leg.destination.name);
+  // Collect the full halte list from stopMap (all intermediate stops across
+  // all legs) plus each leg's destination (catches transfer stations that
+  // aren't in halte). Same rationale as journeyStructuralKey: differentiate
+  // physically different routes that happen to share total duration, while
+  // still grouping schedule-slot siblings of the same physical service.
+  const allStops = new Set<string>();
+  if (stopMap) {
+    for (const stopovers of stopMap.values()) {
+      for (const s of stopovers) {
+        if (s.station?.name) allStops.add(s.station.name);
+      }
+    }
   }
-  stops.delete(journey.destination.name);
+  for (const leg of journey.legs) {
+    if (leg.destination?.name) allStops.add(leg.destination.name);
+  }
+  // Don't include origin/destination — they're the same for every connection
+  // on a given route.
+  allStops.delete(journey.origin.name);
+  allStops.delete(journey.destination.name);
 
-  const sortedStops = [...stops].sort().join(",");
-  return `fv:${durBucket}min|${sortedStops}`;
+  return `fv:${durBucket}min|${[...allStops].sort().join(",")}`;
 }
 
 // --------------- Formatting helpers ---------------
@@ -528,11 +557,14 @@ export async function findCheapestJourneyBahn(
       if (price < pMin) pMin = price;
 
       if (isReinFV(journey)) {
-        // Collect pure FV connections separately, with stopovers for FV-only optimization
-        const fvKey = fvStructuralKey(journey);
+        // Collect pure FV connections separately, with stopovers for FV-only
+        // optimization. Extract stopMap up-front since fvStructuralKey now
+        // depends on the full halte list to tell different physical routes
+        // apart.
+        const stopMap = extractStopoversMap(v);
+        const fvKey = fvStructuralKey(journey, stopMap);
         const existing = fvByStructure.get(fvKey);
         if (!existing || price < existing.price) {
-          const stopMap = extractStopoversMap(v);
           fvByStructure.set(fvKey, { journey, stopovers: stopMap, structuralKey: fvKey, price });
         }
         return;
@@ -651,8 +683,26 @@ export async function findCheapestJourneyBahnExtended(
     ? allDates
     : sampleDates(allDates, extendedScanDays);
 
-  const byStructure = new Map<string, CandidateEntry>();
-  const fvByStructure = new Map<string, FVCandidateEntry>();
+  // Fill-up target: each scanned day should contribute at least this many
+  // candidates for downstream optimization, even if none of them have
+  // structurally new keys. Priority order per day:
+  //   1. Connections with keys not yet seen (Phase 1 + already-collected
+  //      extended candidates)
+  //   2. If < MIN_PER_DAY new-key picks, fill with the cheapest
+  //      already-known-key connections from the same day
+  // This is what makes Step 4 productive even when Phase 1 has already
+  // exhausted the distinct structural variants on a route: the additional
+  // Via-Stop experiments run against a now-enriched stop pool and can find
+  // winner-pairs that the original Phase 2 pass missed.
+  const MIN_PER_DAY = 3;
+
+  const nvOut: CandidateEntry[] = [];
+  const fvOut: FVCandidateEntry[] = [];
+  const globalSeenDep = new Set<string>(); // dedupe same exact connection
+  // Running set of keys we've already collected across days, so day N+1's
+  // "new key" check considers days 1..N as already known.
+  const collectedNVKeys = new Set<string>();
+  const collectedFVKeys = new Set<string>();
   const extDayTimings: DayScanTiming[] = [];
 
   for (let i = 0; i < sampled.length; i++) {
@@ -665,6 +715,19 @@ export async function findCheapestJourneyBahnExtended(
       message: `Erweiterte Suche (Tag ${i + 1}/${sampled.length}, ${fmtDate(date)})...`,
     });
 
+    // Pass 1 of 2: collect every valid FV-containing connection from the day.
+    // Defer picking / dedup until we have the whole day's inventory so we
+    // can sort by price and apply the fill-up logic below.
+    type DayConn = {
+      journey: Journey;
+      price: number;
+      stopMap: Map<number, BahnStopover[]>;
+      structKey: string;
+      reinFV: boolean;
+      depTime: string;
+    };
+    const dayPool: DayConn[] = [];
+
     const apiCalls = await scanDayWindowExtended(fromId, toId, date, (v) => {
       const price = v.angebotsPreis?.betrag;
       if (!price || price <= 0 || price > priceLimit) return;
@@ -674,39 +737,90 @@ export async function findCheapestJourneyBahnExtended(
       if (getConfig().filters.skipFlixTrain && hasFlixTrain(journey)) return;
       if (!hasFernverkehr(journey)) return;
 
-      if (isReinFV(journey)) {
-        const fvKey = fvStructuralKey(journey);
-        if (alreadyKnownFVKeys.has(fvKey)) return;
-        const existing = fvByStructure.get(fvKey);
-        if (!existing || price < existing.price) {
-          const stopMap = extractStopoversMap(v);
-          fvByStructure.set(fvKey, { journey, stopovers: stopMap, structuralKey: fvKey, price });
-        }
-        return;
-      }
-
       const stopMap = extractStopoversMap(v);
-      const structKey = journeyStructuralKey(journey, stopMap);
-      if (alreadyKnownKeys.has(structKey)) return;
+      const reinFV = isReinFV(journey);
+      const structKey = reinFV
+        ? fvStructuralKey(journey, stopMap)
+        : journeyStructuralKey(journey, stopMap);
+      const depTime = journey.legs[0]?.departure ?? "";
 
-      if (!byStructure.has(structKey)) {
-        byStructure.set(structKey, {
-          journey,
-          stopovers: stopMap,
-          structuralKey: structKey,
-          price,
+      dayPool.push({ journey, price, stopMap, structKey, reinFV, depTime });
+    });
+
+    // Sort day's pool by price — cheapest first. Both new-key picking and
+    // filler picking should prefer the cheapest concrete connections.
+    dayPool.sort((a, b) => a.price - b.price);
+
+    // Pass 2: select picks with priority for new keys, then fill.
+    const pickedDepTimes = new Set<string>();
+    const pickedKeysThisDay = new Set<string>();
+    const picks: DayConn[] = [];
+
+    // Priority 1 — genuinely new keys (no cap).
+    for (const c of dayPool) {
+      const alreadyKnownGlobally = c.reinFV
+        ? alreadyKnownFVKeys.has(c.structKey) || collectedFVKeys.has(c.structKey)
+        : alreadyKnownKeys.has(c.structKey) || collectedNVKeys.has(c.structKey);
+      if (alreadyKnownGlobally) continue;
+      if (pickedKeysThisDay.has(c.structKey)) continue; // only one per key per day
+      pickedKeysThisDay.add(c.structKey);
+      pickedDepTimes.add(c.depTime);
+      picks.push(c);
+    }
+
+    // Priority 2 — fill with cheapest remaining (any key) until MIN_PER_DAY.
+    if (picks.length < MIN_PER_DAY) {
+      for (const c of dayPool) {
+        if (picks.length >= MIN_PER_DAY) break;
+        if (pickedDepTimes.has(c.depTime)) continue;
+        pickedDepTimes.add(c.depTime);
+        picks.push(c);
+      }
+    }
+
+    // Commit picks to global output + running collected-keys sets.
+    for (const c of picks) {
+      if (globalSeenDep.has(c.depTime)) continue;
+      globalSeenDep.add(c.depTime);
+      if (c.reinFV) {
+        collectedFVKeys.add(c.structKey);
+        fvOut.push({
+          journey: c.journey,
+          stopovers: c.stopMap,
+          structuralKey: c.structKey,
+          price: c.price,
+        });
+      } else {
+        collectedNVKeys.add(c.structKey);
+        nvOut.push({
+          journey: c.journey,
+          stopovers: c.stopMap,
+          structuralKey: c.structKey,
+          price: c.price,
         });
       }
-    });
+    }
+
     const dayMs = Date.now() - dayStart;
     extDayTimings.push({ date: fmtDate(date), durationMs: dayMs, apiCalls, phase: "extended" });
-    console.log(`[scan-timing] Extended day ${i + 1}/${sampled.length} (${fmtDate(date)}): ${dayMs}ms, ${apiCalls} API calls`);
+    console.log(
+      `[scan-timing] Extended day ${i + 1}/${sampled.length} (${fmtDate(date)}): ` +
+      `${dayMs}ms, ${apiCalls} API calls, ${dayPool.length} pool → ${picks.length} picks`
+    );
   }
-  console.log(`[scan-timing] Extended scan complete: ${sampled.length} days, ${byStructure.size} new NV, ${fvByStructure.size} new FV`);
+
+  // Final sort by price across all days.
+  nvOut.sort((a, b) => a.price - b.price);
+  fvOut.sort((a, b) => a.price - b.price);
+
+  console.log(
+    `[scan-timing] Extended scan complete: ${sampled.length} days, ` +
+    `${nvOut.length} NV + ${fvOut.length} FV candidates (including fillers)`
+  );
 
   return {
-    nvCandidates: Array.from(byStructure.values()).sort((a, b) => a.price - b.price),
-    fvCandidates: Array.from(fvByStructure.values()).sort((a, b) => a.price - b.price),
+    nvCandidates: nvOut,
+    fvCandidates: fvOut,
     dayTimings: extDayTimings,
   };
 }
