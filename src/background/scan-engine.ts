@@ -41,6 +41,22 @@ import { calculateZScore } from "../shared/zpair-types";
 // score thresholds, pCap multipliers) now live in the remote config — see
 // shared/config.ts. Read them at call time via getConfig().
 
+/**
+ * Pool-size threshold beyond which FV-Seed experiments are skipped.
+ *
+ * The FV-Seed step spawns 5 random experiments per FV candidate to
+ * discover NV legs that enrich the shared stop pool. When the pool is
+ * already large (>100 stops) the enrichment value collapses — historical
+ * data shows the seed step produces strictly-better hits in only ~1% of
+ * scans at Pool 100-200 and 0% at Pool 200+. At the same time the seeds
+ * consume 40-80 API calls per extended scan (~115s wall time).
+ *
+ * With scan-wide dedup (v1.2.5) the random picker in generateCandidate-
+ * Configs is already well-fed by the main fv_phase2 + ext_fv_phase2 runs
+ * — the seed step becomes almost pure overhead past this threshold.
+ */
+const FV_SEED_POOL_SKIP_THRESHOLD = 100;
+
 // ============================================================
 // ExperimentRecord — enriched experiment data for analytics
 // ============================================================
@@ -809,8 +825,17 @@ async function runExtendedScan(
     }
     if (extStopPool.length < 2) continue;
 
-    // FV Seed
-    const seedExps = generateCandidateConfigs(extStopPool, [], fromId, toId, testedPairs).slice(0, 5);
+    // FV Seed — skip when pool is already well-filled (see constant comment).
+    // In extended scans this is the more common case: the pool has grown
+    // through Phase 1+2 + earlier extended steps, so seeding past 100 stops
+    // mostly burns API budget without finding new NV legs.
+    const skipExtSeed = extStopPool.length > FV_SEED_POOL_SKIP_THRESHOLD;
+    if (skipExtSeed) {
+      console.log(`[ext-fv-seed] Skipping seed step: pool has ${extStopPool.length} stops (> ${FV_SEED_POOL_SKIP_THRESHOLD})`);
+    }
+    const seedExps = skipExtSeed
+      ? []
+      : generateCandidateConfigs(extStopPool, [], fromId, toId, testedPairs).slice(0, 5);
     if (seedExps.length > 0) {
       const seedResult = await verifyConfigs(seedExps, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,
@@ -1223,7 +1248,16 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         if (sharedStopPool.length < 2) continue;
 
         // --- FV Seed Step: 5 random experiments from shared pool to discover NV legs ---
-        const seedExperiments = generateCandidateConfigs(sharedStopPool, [], fromId, toId, testedPairs).slice(0, 5);
+        // Skip entirely when the pool is already well-filled (see constant
+        // comment). Saves ~5 API calls × N FV candidates with <1% hit-quality
+        // cost past Pool 100.
+        const skipSeed = sharedStopPool.length > FV_SEED_POOL_SKIP_THRESHOLD;
+        if (skipSeed) {
+          console.log(`[fv-seed] Skipping seed step: pool has ${sharedStopPool.length} stops (> ${FV_SEED_POOL_SKIP_THRESHOLD})`);
+        }
+        const seedExperiments = skipSeed
+          ? []
+          : generateCandidateConfigs(sharedStopPool, [], fromId, toId, testedPairs).slice(0, 5);
         phase2ExperimentsGenerated += seedExperiments.length;
 
         if (seedExperiments.length > 0) {

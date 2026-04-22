@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bahnbrechend",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "Findet die günstigste Zugverbindung mit der höchsten Wahrscheinlichkeit der Zugbindungsaufhebung",
   "permissions": [
     "declarativeNetRequest",
