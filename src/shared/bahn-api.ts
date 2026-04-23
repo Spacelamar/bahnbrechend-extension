@@ -917,7 +917,13 @@ async function callBahnApi(body: Record<string, unknown>): Promise<BahnApiRespon
         "Priority": "u=1, i",
       },
       body: JSON.stringify(body),
-      credentials: "include", // Send any existing bahn.de cookies
+      // `int.bahn.de/web/api/angebote/fahrplan` is a public endpoint and
+      // doesn't need user cookies. We OMIT credentials so that if bahn.de
+      // ever wires authentication onto this endpoint, the extension can't
+      // be weaponised as a cross-origin CSRF vector acting as the logged-in
+      // bahn.de user (combined with the declarativeNetRequest Origin-spoof
+      // that would otherwise be concerning).
+      credentials: "omit",
       signal: AbortSignal.timeout(15000),
     });
 
