@@ -692,8 +692,17 @@ async function runExtendedScan(
     }
     if (extStopPool.length < 2) continue;
 
-    // FV Seed Step
-    const seedExperiments = generateCandidateConfigs(extStopPool, [], fromId, toId, testedPairs).slice(0, 5);
+    // FV Seed Step — skip when pool is already well-filled (same
+    // threshold as Step 6 and Phase 2b; see constant comment). When
+    // Extended runs on top of inherited state the pool typically starts
+    // at ~140 stops, so Step-3 seed is almost always redundant.
+    const skipStep3Seed = extStopPool.length > FV_SEED_POOL_SKIP_THRESHOLD;
+    if (skipStep3Seed) {
+      console.log(`[ext-step3-seed] Skipping seed step: pool has ${extStopPool.length} stops (> ${FV_SEED_POOL_SKIP_THRESHOLD})`);
+    }
+    const seedExperiments = skipStep3Seed
+      ? []
+      : generateCandidateConfigs(extStopPool, [], fromId, toId, testedPairs).slice(0, 5);
     if (seedExperiments.length > 0) {
       const seedResult = await verifyConfigs(seedExperiments, entry.journey, {
         originalPrice: entry.price, pMin, pCap, pCapExt,

@@ -382,7 +382,11 @@ async function scanDayWindow(
   let currentTime = start;
   let emptyCount = 0;
   let apiCalls = 0;
-  const MAX_EMPTY = 3;
+  // 2 statt 3: bahn.de liefert am Rand eines Zeitfensters oft 1-2 leere
+  // 30-Min-Slots bevor der nächste Zug beginnt. 3 verschwendet noch einen
+  // API-Call am Ende. 2 reicht — bahn.de packt bei bestehendem Angebot
+  // im Window mindestens 1 Verbindung in jede 30-Min-Response.
+  const MAX_EMPTY = 2;
   const seenDeps = new Set<string>();
 
   while (currentTime <= end && emptyCount < MAX_EMPTY) {
@@ -436,7 +440,11 @@ async function scanDayWindowExtended(
   let currentTime = start;
   let emptyCount = 0;
   let apiCalls = 0;
-  const MAX_EMPTY = 3;
+  // 2 statt 3: bahn.de liefert am Rand eines Zeitfensters oft 1-2 leere
+  // 30-Min-Slots bevor der nächste Zug beginnt. 3 verschwendet noch einen
+  // API-Call am Ende. 2 reicht — bahn.de packt bei bestehendem Angebot
+  // im Window mindestens 1 Verbindung in jede 30-Min-Response.
+  const MAX_EMPTY = 2;
   const seenDeps = new Set<string>();
 
   while (currentTime <= end && emptyCount < MAX_EMPTY) {

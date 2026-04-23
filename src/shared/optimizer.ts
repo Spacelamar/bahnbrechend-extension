@@ -100,11 +100,21 @@ export function generateCandidateConfigs(
 
   let skippedAlreadyTested = 0;
 
+  // Dedup-Key: order-insensitive für 2-Stop-Paare. bahn.de sortiert
+  // `zwischenhalte` intern geografisch — die Reihenfolge in unserem
+  // POST-Body hat keinen Einfluss auf die Antwort. Order-free Key
+  // verhindert dass wir [A,B] und [B,A] als zwei separate Calls feuern.
+  // Für 1-Stop-Paare ist der Key trivial gleich.
+  const pairKey = (stops: Station[]): string =>
+    stops.length === 2
+      ? [stops[0].id, stops[1].id].sort().join(",")
+      : stops.map((s) => s.id).join(",");
+
   // Tier 1: Winners from persistent pool
   for (const zp of topZPairs) {
     const pair = [zp.stop1, zp.stop2];
     if (!isValidPair(pair)) continue;
-    const key = pair.map(s => s.id).join(",");
+    const key = pairKey(pair);
     if (seen.has(key)) continue;
     if (scanDedup?.has(key)) { skippedAlreadyTested++; continue; }
     seen.add(key);
@@ -125,7 +135,7 @@ export function generateCandidateConfigs(
       const pair = pick2Random(stopPool);
       if (!pair) break;
       if (!isValidPair(pair)) continue;
-      const key = pair.map((s) => s.id).join(",");
+      const key = pairKey(pair);
       if (seen.has(key)) continue;
       if (scanDedup?.has(key)) { skippedAlreadyTested++; continue; }
       seen.add(key);
@@ -133,7 +143,7 @@ export function generateCandidateConfigs(
       experiments.push({ stops: pair, fromCache: false });
     }
   } else if (stopPool.length === 1) {
-    const key = stopPool[0].id;
+    const key = pairKey(stopPool);
     if (!seen.has(key) && !scanDedup?.has(key)) {
       seen.add(key);
       scanDedup?.add(key);
