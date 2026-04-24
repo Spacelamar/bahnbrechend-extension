@@ -186,6 +186,43 @@ function checkAborted(signal: AbortSignal): void {
 }
 
 // ============================================================
+// Helper: aggregate zPair updates to max-per-scan-per-pair
+// ============================================================
+
+/**
+ * Reduziert die während des Scans gesammelten zPair-Updates auf den
+ * jeweils höchsten zScore pro (order-insensitive) Stop-Paar.
+ *
+ * Ein Paar kann innerhalb eines Scans mehrfach an die bahn.de-API gehen
+ * (verschiedene Candidates draften dasselbe Paar, FV-Seed + Main-FV
+ * testen es, etc.). Ohne Aggregation würde jedes dieser Einzelwerte
+ * als separates "Experiment" in den Pool fließen, den Mittelwert
+ * verdünnen und Paare mit Peak-Potenzial bestrafen:
+ *
+ *   Paar (A,B) im Scan 4× getestet: [0.95, 0.20, 0.30, 0.10]
+ *   Alt: push alle 4 → mean wird mit 4 Werten verwässert (0.39)
+ *   Neu: push nur max=0.95 → Paar hat auf dieser Route 0.95 bewiesen
+ *
+ * Die Pool-Logik (zpair-pool.ts) mittelt weiterhin über Scans hinweg —
+ * wenn das Paar in mehreren Scans nicht wieder Peak liefert, fällt der
+ * Mean über die Zeit. Aber jeder Scan zählt nur einmal.
+ *
+ * Der Dedup-Key ist order-insensitive (sortierte stop-IDs), konsistent
+ * mit dem scan-weiten Dedup in generateCandidateConfigs (v1.2.8 / Q4).
+ */
+function aggregateZPairUpdates(updates: ZPairUpdate[]): ZPairUpdate[] {
+  const byKey = new Map<string, ZPairUpdate>();
+  for (const u of updates) {
+    const k = [u.stop1.id, u.stop2.id].sort().join(",");
+    const prev = byKey.get(k);
+    if (!prev || u.zScore > prev.zScore) {
+      byKey.set(k, u);
+    }
+  }
+  return [...byKey.values()];
+}
+
+// ============================================================
 // Helper functions
 // ============================================================
 
@@ -1079,7 +1116,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
     if (phase1 === null) {
       scanData.errorMessage = "Keine Verbindung gefunden";
       scanData.terminationReason = "no_connection";
-      return { scanData, experiments: allExperiments, zPairUpdates };
+      return { scanData, experiments: allExperiments, zPairUpdates: aggregateZPairUpdates(zPairUpdates) };
     }
 
     ({ candidates, fvCandidates, pMin, nearDateWarning } = { ...phase1 });
@@ -1101,7 +1138,7 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         null, dateStr, [], 0, 0, 0,
         false, false, true, nearDateWarning, false
       ));
-      return { scanData, experiments: allExperiments, zPairUpdates };
+      return { scanData, experiments: allExperiments, zPairUpdates: aggregateZPairUpdates(zPairUpdates) };
     }
 
     const cfgPrice = getConfig().price;
@@ -1480,11 +1517,18 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
 
       // Fallback 2: even if we have some >=80% results, if none of them
       // is >=90% (scoring.ideal), surface any 90%+ configs that were
-      // found above pCapExt but below pCapMax (4× pMin). Rationale: a
-      // 91% result at 3.5× pMin is more useful to show than a 82% at
-      // pCap — the user can decide whether the extra cost is worth
-      // the higher cancellation-probability score.
-      const pCapMax = pMin * 4;
+      // found above pCapExt but below pCapMax. Rationale: a 91% result
+      // at 3.5× pMin is more useful to show than a 82% at pCap — the
+      // user can decide whether the extra cost is worth the higher
+      // cancellation-probability score.
+      //
+      // Multiplier switch: Bei sehr billigen Routen (pMin < 15€) ist das
+      // absolute Preisfenster pMin→4×pMin extrem eng (z.B. pMin=14.99€ →
+      // Fenster bis 59.96€). Top-Configs landen oft zwischen 60-75€ und
+      // würden verworfen werden trotz exzellentem Score. Auf solchen
+      // Routen spannen wir das Fenster per 5× statt 4× auf. Ab pMin=15€
+      // ist 4×60=240€ schon großzügig genug.
+      const pCapMax = pMin < 15 ? pMin * 5 : pMin * 4;
       const idealScore = getConfig().scoring.ideal;
       if (bestScore < idealScore && highScoreConfigs.length > 0) {
         const idealOverCap = highScoreConfigs.filter(c =>
@@ -1567,5 +1611,5 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
     releaseConfig();
   }
 
-  return { scanData, experiments: allExperiments, zPairUpdates };
+  return { scanData, experiments: allExperiments, zPairUpdates: aggregateZPairUpdates(zPairUpdates) };
 }
