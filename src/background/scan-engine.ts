@@ -1555,11 +1555,44 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         false, true, allReinFV && allVerified.length === 0, nearDateWarning, true
       ));
     } else if (canExtend && bestScore >= scoringCfg.min) {
+      // Inline-Promotion: Phase 2 hat ≥70% Ergebnisse gefunden aber
+      // noch kein ≥90%. Wenn wir in `allExtendedCandidates` bereits
+      // ≥90%-Configs haben (Price zwischen pCap und pCapExt, Score
+      // ≥ 70% erreicht mindestens ideal), direkt anzeigen — kein
+      // "Score verbessern"-Klick nötig um sie aufzudecken.
+      //
+      // Rationale: Der User ist nur an ≥90%-Results wirklich interessiert
+      // (darunter ist die Cancellation-Wahrscheinlichkeit zu unsicher).
+      // Wenn wir sie schon in der Hand haben, soll sie der User auch
+      // sehen — nur teurer als ein Standard-Ergebnis, aber score-stark.
+      const alreadyInResults = (c: VerifiedConfig): boolean =>
+        allVerified.some(v =>
+          `${v.totalPrice.toFixed(2)}-${(v.score * 1000).toFixed(0)}`
+          === `${c.totalPrice.toFixed(2)}-${(c.score * 1000).toFixed(0)}`
+        );
+      const idealExt = allExtendedCandidates.filter(
+        (c) => c.score >= scoringCfg.ideal && !alreadyInResults(c)
+      );
+      if (idealExt.length > 0) {
+        console.log(
+          `[inline-extended] Promoted ${idealExt.length} ideal-score (>=${(scoringCfg.ideal * 100).toFixed(0)}%) ` +
+          `extended candidates into results without running extended scan`
+        );
+        allVerified = deduplicateConfigs([...allVerified, ...idealExt]);
+        allVerified.sort((a, b) => b.score - a.score);
+        bestScore = allVerified.length > 0 ? allVerified[0].score : 0;
+      }
+
+      // Wenn nach Promotion der Score ideal erreicht: kein
+      // "Score verbessern" Button mehr (Extended-Scan nicht mehr nötig).
+      // Sonst bleibt der Button wie bisher.
+      const stillCanExtend = bestScore < scoringCfg.ideal;
+
       const displayJourney = candidates[0]?.journey || (fvCandidates[0]?.journey ?? null);
       onResult(buildResult(
         displayJourney, dateStr, allVerified,
         pMin, pCap, bestScore,
-        true, false, false, nearDateWarning, false
+        stillCanExtend, false, false, nearDateWarning, false
       ));
     } else {
       const displayJourney = candidates[0]?.journey || (fvCandidates[0]?.journey ?? null);
