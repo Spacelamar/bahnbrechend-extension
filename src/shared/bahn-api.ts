@@ -26,7 +26,7 @@ interface BahnVerkehrsmittel {
 interface BahnAbschnitt {
   abfahrtsOrt?: string;
   ankunftsOrt?: string;
-  abfahrtsZeitpunkt?: string;
+  abfahrtsZeitpunkt?: string | null;
   ankunftsZeitpunkt?: string;
   abfahrtsOrtExtId?: string;
   ankunftsOrtExtId?: string;
@@ -59,6 +59,15 @@ interface BahnApiResponse {
     earlier?: string;
     later?: string;
   };
+}
+
+export interface BahnDepartureSection {
+  abfahrtsZeitpunkt?: string | null;
+  abfahrt?: { sollzeit?: string | null };
+}
+
+export function getSectionDeparture(abschnitt: BahnDepartureSection | null | undefined): string | undefined {
+  return abschnitt?.abfahrtsZeitpunkt || abschnitt?.abfahrt?.sollzeit || undefined;
 }
 
 // --------------- FV detection ---------------
@@ -248,7 +257,7 @@ function bahnToJourney(v: BahnVerbindung): Journey | null {
         id: a.ankunftsOrtExtId || "",
         name: a.ankunftsOrt || "",
       },
-      departure: a.abfahrtsZeitpunkt || a.abfahrt?.sollzeit || "",
+      departure: getSectionDeparture(a) || "",
       arrival: a.ankunftsZeitpunkt || a.ankunft?.sollzeit || "",
       line: {
         id: a.verkehrsmittel?.nummer || "",
@@ -403,7 +412,7 @@ async function scanDayWindow(
     emptyCount = 0;
     for (const v of verbindungen) {
       // Deduplicate by departure time
-      const dep = v.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+      const dep = getSectionDeparture(v.verbindungsAbschnitte?.[0]);
       if (dep && !seenDeps.has(dep)) {
         seenDeps.add(dep);
         onVerbindung(v);
@@ -411,8 +420,9 @@ async function scanDayWindow(
     }
 
     // Next request: after last departure
-    const lastDep = verbindungen[verbindungen.length - 1]
-      ?.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+    const lastDep = getSectionDeparture(
+      verbindungen[verbindungen.length - 1]?.verbindungsAbschnitte?.[0]
+    );
     if (lastDep) {
       const lastDepTime = new Date(lastDep);
       currentTime = new Date(lastDepTime.getTime() + 1 * 60 * 1000);
@@ -460,15 +470,16 @@ async function scanDayWindowExtended(
 
     emptyCount = 0;
     for (const v of verbindungen) {
-      const dep = v.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+      const dep = getSectionDeparture(v.verbindungsAbschnitte?.[0]);
       if (dep && !seenDeps.has(dep)) {
         seenDeps.add(dep);
         onVerbindung(v);
       }
     }
 
-    const lastDep = verbindungen[verbindungen.length - 1]
-      ?.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+    const lastDep = getSectionDeparture(
+      verbindungen[verbindungen.length - 1]?.verbindungsAbschnitte?.[0]
+    );
     if (lastDep) {
       currentTime = new Date(new Date(lastDep).getTime() + 1 * 60 * 1000);
     } else {
