@@ -13,6 +13,7 @@
   "scripts": {
     "build": "node build.mjs",
     "build:prod": "NODE_ENV=production node build.mjs",
+    "test": "node scripts/build-tests.mjs && node --test dist-tests/*.test.js",
     "watch": "node build.mjs --watch",
     "typecheck": "tsc --noEmit"
   },

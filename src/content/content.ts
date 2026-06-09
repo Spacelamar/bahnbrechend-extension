@@ -22,6 +22,7 @@ window.addEventListener("message", (event) => {
 // Background Worker → Web Page — explicit origin (no wildcard) so that
 // only the expected page receives ExtMessages.
 chrome.runtime.onMessage.addListener((message) => {
-  if (!isExtMessage(message)) return;
+  if (!isExtMessage(message)) return false;
   window.postMessage(message, PAGE_ORIGIN);
+  return false;
 });

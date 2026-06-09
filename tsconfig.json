@@ -8,7 +8,7 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "esModuleInterop": true,
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],
     "types": ["chrome-types"],
     "skipLibCheck": true
   },
