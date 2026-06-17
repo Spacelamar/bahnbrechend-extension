@@ -40,6 +40,11 @@ Die `dist/`-Ausgabe kann direkt in Chrome als "Entpackte Erweiterung" geladen
 werden (`chrome://extensions` → Entwicklermodus aktivieren → "Entpackte
 Erweiterung laden").
 
+`node build.mjs` erzeugt einen un-minifizierten Entwickler-Build. Die in den
+Stores veröffentlichte Version ist minifiziert — wer den Build bit-genau mit
+der Store-Version vergleichen will, nutzt `npm run build:prod` (siehe
+[REPRODUCIBLE.md](./REPRODUCIBLE.md)).
+
 ## Verifizierbarkeit
 
 Siehe **[REPRODUCIBLE.md](./REPRODUCIBLE.md)** — Anleitung wie du den lokal

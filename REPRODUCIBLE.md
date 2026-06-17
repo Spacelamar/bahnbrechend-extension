@@ -25,9 +25,9 @@ aber identisch.
 ```bash
 git clone https://github.com/Spacelamar/bahnbrechend-extension.git
 cd bahnbrechend-extension
-git checkout v1.2.0          # Oder welche Version du prüfst
+git checkout v1.2.17         # Oder welche Version du prüfst
 npm ci                       # Deterministisch, nutzt package-lock.json
-node build.mjs               # Baut nach dist/
+npm run build:prod           # Minifizierter Store-Build → dist/ (Chrome) + dist-firefox/ (Firefox)
 ```
 
 ## Schritt 2: Installierte Chrome-Extension finden
@@ -48,8 +48,12 @@ z.B.): `~/.mozilla/firefox/<profile>/extensions/extension@bahnbrechend.net.xpi`
 
 ## Schritt 3: Vergleichen
 
-Vergleiche den Inhalt deines `dist/`-Ordners mit dem entpackten Store-Ordner.
-Unter Linux/macOS:
+Vergleiche den gebauten Ordner mit dem entpackten Store-Ordner — **für Chrome
+`dist/`, für Firefox `dist-firefox/`**. Die beiden unterscheiden sich bewusst
+im Manifest (Chrome: Service Worker, Firefox: Event-Page), deshalb jeweils den
+passenden Ordner vergleichen.
+
+Unter Linux/macOS (Beispiel Chrome):
 
 ```bash
 diff -r dist/ "<PFAD ZUM STORE-ORDNER>/"
