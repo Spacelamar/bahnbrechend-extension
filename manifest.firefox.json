@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Bahnbrechend",
-  "version": "1.2.10",
+  "version": "1.2.17",
   "description": "Findet die günstigste Zugverbindung mit der höchsten Wahrscheinlichkeit der Zugbindungsaufhebung",
   "permissions": [
     "declarativeNetRequest",
-    "storage"
+    "alarms"
   ],
   "host_permissions": [
     "*://int.bahn.de/*",
@@ -30,8 +30,7 @@
     {
       "matches": [
         "*://bahnbrechend.net/*",
-        "*://www.bahnbrechend.net/*",
-        "http://localhost:3000/*"
+        "*://www.bahnbrechend.net/*"
       ],
       "js": [
         "content.js"

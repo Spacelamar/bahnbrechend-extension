@@ -14,7 +14,7 @@
  */
 
 import { isValidWebMessage, type WebMessage, type ExtMessage, type ScanStartPayload } from "../shared/protocol";
-import { runScan, type InheritedScanState } from "./scan-engine";
+import { runScan, getCachedScanState, clearCachedScanState, type InheritedScanState } from "./scan-engine";
 import { routeKey } from "../shared/zpair-types";
 
 // Hard ceiling on scan runtime — if bahn.de ever hangs, a well-behaved
@@ -45,6 +45,12 @@ const ALLOWED_HOSTNAMES = new Set([
 
 let activeController: AbortController | null = null;
 let activeTimeout: ReturnType<typeof setTimeout> | null = null;
+/** Tab that initiated the active scan. Used by the tabs.onRemoved
+ *  listener (registered once below) to abort scans whose originating
+ *  tab the user just closed — covers tab-close + browser-quit cases
+ *  where the page-side pagehide/beforeunload handlers may not get a
+ *  chance to deliver scan_cancel before the runtime tears down. */
+let activeOriginTabId: number | null = null;
 
 function clearScanTimeout() {
   if (activeTimeout) {
@@ -52,6 +58,20 @@ function clearScanTimeout() {
     activeTimeout = null;
   }
 }
+
+// Tab-close / window-close defense. Fires once per closed tab; we
+// match against the active scan's origin tab and abort if it's the
+// one going away. Registered at module load — outside handleMessage
+// so the listener stays alive across service-worker resumes.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (activeOriginTabId !== null && tabId === activeOriginTabId && activeController) {
+    console.log(`[bahnbrechend] Origin tab ${tabId} closed mid-scan — aborting`);
+    activeController.abort();
+    activeController = null;
+    activeOriginTabId = null;
+    clearScanTimeout();
+  }
+});
 
 /**
  * Send an ExtMessage to a specific tab. Replaces the old sendToWeb()
@@ -114,6 +134,7 @@ export function handleMessage(message: unknown, sender: chrome.runtime.MessageSe
       const requestId = msg.requestId;
       const signal = activeController.signal;
       const originTabId = tabId; // captured for scoped responses
+      activeOriginTabId = tabId;  // for tabs.onRemoved abort path
 
       activeTimeout = setTimeout(() => {
         console.warn(`[bahnbrechend] Scan exceeded ${SCAN_TIMEOUT_MS / 60000}min timeout, aborting`);
@@ -130,28 +151,25 @@ export function handleMessage(message: unknown, sender: chrome.runtime.MessageSe
       const startScan = async () => {
         let inheritedState: InheritedScanState | undefined;
         if (isExtended) {
-          try {
-            const stored = await chrome.storage.session.get("lastScanState");
-            const s = stored.lastScanState as InheritedScanState | undefined;
-            if (s) {
-              const routeMatch = s.fromId === payload.fromId && s.toId === payload.toId;
-              const dateMatch = s.dateStr === payload.date;
-              const age = Date.now() - s.timestamp;
-              const fresh = age < STATE_MAX_AGE_MS;
-              if (routeMatch && dateMatch && fresh) {
-                inheritedState = s;
-                console.log(`[bahnbrechend] Reusing state from ${Math.round(age / 1000)}s ago (${s.sharedStopPool.length} pool stops, ${s.allVerified.length} verified)`);
-              } else {
-                console.log(`[bahnbrechend] Skipping inherited state — routeMatch=${routeMatch} dateMatch=${dateMatch} fresh=${fresh} (age=${Math.round(age / 1000)}s)`);
-                // Proactively clear stale state so it cannot leak into a
-                // different route's future scan (defense in depth).
-                if (!routeMatch || !dateMatch) {
-                  chrome.storage.session.remove("lastScanState").catch(() => {});
-                }
+          // In-memory cache only — see scan-engine.ts header for why we
+          // dropped chrome.storage.session (Firefox MV3 hang risk).
+          const s = getCachedScanState();
+          if (s) {
+            const routeMatch = s.fromId === payload.fromId && s.toId === payload.toId;
+            const dateMatch = s.dateStr === payload.date;
+            const age = Date.now() - s.timestamp;
+            const fresh = age < STATE_MAX_AGE_MS;
+            if (routeMatch && dateMatch && fresh) {
+              inheritedState = s;
+              console.log(`[bahnbrechend] Reusing in-memory state from ${Math.round(age / 1000)}s ago (${s.sharedStopPool.length} pool stops, ${s.allVerified.length} verified)`);
+            } else {
+              console.log(`[bahnbrechend] Skipping inherited state — routeMatch=${routeMatch} dateMatch=${dateMatch} fresh=${fresh} (age=${Math.round(age / 1000)}s)`);
+              // Drop stale state so a wrong-route scan can't accidentally
+              // pick it up (defense in depth).
+              if (!routeMatch || !dateMatch) {
+                clearCachedScanState();
               }
             }
-          } catch (err) {
-            console.warn("[bahnbrechend] Failed to read lastScanState:", err);
           }
         }
 
@@ -193,6 +211,7 @@ export function handleMessage(message: unknown, sender: chrome.runtime.MessageSe
           },
         });
         activeController = null;
+        activeOriginTabId = null;
         clearScanTimeout();
       }).catch((err) => {
         if (err?.message === "cancelled") {
@@ -207,6 +226,7 @@ export function handleMessage(message: unknown, sender: chrome.runtime.MessageSe
           });
         }
         activeController = null;
+        activeOriginTabId = null;
         clearScanTimeout();
       });
       break;
@@ -216,6 +236,7 @@ export function handleMessage(message: unknown, sender: chrome.runtime.MessageSe
       if (activeController) {
         activeController.abort();
         activeController = null;
+        activeOriginTabId = null;
         clearScanTimeout();
         console.log("[bahnbrechend] Scan cancelled");
       }

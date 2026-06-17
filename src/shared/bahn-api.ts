@@ -211,6 +211,17 @@ function fmtDate(date: Date): string {
 
 // --------------- Convert bahn.de response to Journey ---------------
 
+/**
+ * Read departure timestamp from an abschnitt, supporting both the legacy
+ * top-level `abfahrtsZeitpunkt` field and the new nested `abfahrt.sollzeit`
+ * shape that bahn.de switched to on 2026-05-05. Same for arrival. Returns
+ * undefined if neither shape is populated.
+ */
+function getAbschnittDeparture(a: BahnAbschnitt | undefined): string | undefined {
+  if (!a) return undefined;
+  return a.abfahrtsZeitpunkt || a.abfahrt?.sollzeit;
+}
+
 function bahnToJourney(v: BahnVerbindung): Journey | null {
   // Skip Teilpreis offers: the Sparpreis covers only a subset of the legs,
   // the rest must be booked separately. Not useful for Zugbindung-Aufhebung
@@ -402,8 +413,11 @@ async function scanDayWindow(
 
     emptyCount = 0;
     for (const v of verbindungen) {
-      // Deduplicate by departure time
-      const dep = v.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+      // Deduplicate by departure time. bahn.de switched the abschnitt
+      // shape on 2026-05-05 — the legacy `abfahrtsZeitpunkt` top-level
+      // string is gone, replaced with `abfahrt.sollzeit`. The helper
+      // covers both shapes so we don't break older replays.
+      const dep = getAbschnittDeparture(v.verbindungsAbschnitte?.[0]);
       if (dep && !seenDeps.has(dep)) {
         seenDeps.add(dep);
         onVerbindung(v);
@@ -411,8 +425,9 @@ async function scanDayWindow(
     }
 
     // Next request: after last departure
-    const lastDep = verbindungen[verbindungen.length - 1]
-      ?.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+    const lastDep = getAbschnittDeparture(
+      verbindungen[verbindungen.length - 1]?.verbindungsAbschnitte?.[0]
+    );
     if (lastDep) {
       const lastDepTime = new Date(lastDep);
       currentTime = new Date(lastDepTime.getTime() + 1 * 60 * 1000);
@@ -460,15 +475,17 @@ async function scanDayWindowExtended(
 
     emptyCount = 0;
     for (const v of verbindungen) {
-      const dep = v.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+      // Same nested-shape fix as scanDayWindow — see comment there.
+      const dep = getAbschnittDeparture(v.verbindungsAbschnitte?.[0]);
       if (dep && !seenDeps.has(dep)) {
         seenDeps.add(dep);
         onVerbindung(v);
       }
     }
 
-    const lastDep = verbindungen[verbindungen.length - 1]
-      ?.verbindungsAbschnitte?.[0]?.abfahrtsZeitpunkt;
+    const lastDep = getAbschnittDeparture(
+      verbindungen[verbindungen.length - 1]?.verbindungsAbschnitte?.[0]
+    );
     if (lastDep) {
       currentTime = new Date(new Date(lastDep).getTime() + 1 * 60 * 1000);
     } else {

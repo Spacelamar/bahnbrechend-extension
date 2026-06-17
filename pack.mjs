@@ -43,8 +43,15 @@ async function makeZip(rootDir, outFile, overrides = {}) {
 }
 
 async function main() {
+  // Both ZIPs override manifest.json with the on-disk production variant.
+  // build.mjs injects "*://localhost/*" into the dist/ manifest for local
+  // unpacked-load dev work, but that pattern must NOT ship to Chrome Web
+  // Store / Firefox AMO — store reviewers reject extensions that grant
+  // permissions to localhost without a clear justification.
   console.log("Chrome ZIP:");
-  await makeZip("dist", "bahnbrechend-extension.zip");
+  await makeZip("dist", "bahnbrechend-extension.zip", {
+    "manifest.json": "manifest.json",
+  });
 
   console.log("Firefox ZIP (manifest.json swapped for Firefox variant):");
   await makeZip("dist", "bahnbrechend-firefox.zip", {

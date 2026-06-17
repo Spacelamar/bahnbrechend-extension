@@ -121,10 +121,42 @@ export interface ScanAnalytics {
 }
 
 // ============================================================
-// Inherited state — shape persisted to chrome.storage.session at the
-// end of each scan, so a subsequent manual extended scan ("Score
-// verbessern") can pick up where the previous one left off.
+// Inherited state — shape held in module-scope memory at the end of
+// each scan, so a subsequent manual extended scan ("Score verbessern")
+// can pick up where the previous one left off.
+//
+// Why in-memory instead of chrome.storage.session?
+// - In Firefox MV3 (event-page background, not service worker),
+//   chrome.storage.session calls have caused full-scan hangs in the
+//   wild — the API is implemented, but interaction with the event-page
+//   lifecycle is fragile enough that an in-flight `await
+//   chrome.storage.session.set(...)` could orphan the surrounding
+//   Promise chain and freeze the next scan.
+// - Module state survives for the lifetime of the background context.
+//   When the event page is unloaded (Firefox idle, Chrome SW timeout)
+//   we just lose the cache and fall back to a full Phase 1+2 — the
+//   "Score verbessern" UX degrades gracefully to a fresh scan.
+// - Firefox-only restart-resilience was a thin benefit anyway: the
+//   user typically clicks "Score verbessern" within seconds of seeing
+//   results, well before any GC pass would unload us.
 // ============================================================
+
+let inMemoryScanState: InheritedScanState | null = null;
+
+/** External readers (message-handler.ts) use this to retrieve the cache. */
+export function getCachedScanState(): InheritedScanState | null {
+  return inMemoryScanState;
+}
+
+/** Internal writer — invoked at the end of a successful Phase 1+2 run. */
+function setCachedScanState(state: InheritedScanState): void {
+  inMemoryScanState = state;
+}
+
+/** Invalidates the cache when route/date no longer matches. */
+export function clearCachedScanState(): void {
+  inMemoryScanState = null;
+}
 
 /** Serializable form of CandidateEntry (stopovers Map → array of entries). */
 export interface SerializableCandidate {
@@ -1442,13 +1474,10 @@ export async function runScan(params: ScanParams): Promise<ScanAnalytics> {
         highScoreSeen: [...highScoreSeen],
         testedPairs: [...testedPairs],
       };
-      try {
-        await chrome.storage.session.set({ lastScanState: stateToSave });
-        console.log(`[scan] Saved state to session storage (${sharedStopPool.length} pool stops, ${allVerified.length} verified)`);
-      } catch (err) {
-        // Non-fatal — "Score verbessern" just won't have accumulated state
-        console.warn("[scan] Failed to persist lastScanState:", err);
-      }
+      // In-memory cache (no chrome.storage.session — see top-of-file
+      // comment). This is synchronous and cannot hang.
+      setCachedScanState(stateToSave);
+      console.log(`[scan] Cached scan state in memory (${sharedStopPool.length} pool stops, ${allVerified.length} verified)`);
     }
     } // end else (fresh Phase 1+2)
 
